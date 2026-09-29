@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { Worker } from 'bullmq';
 import { prisma } from './db.js';
-import { redis, enqueueNotification } from './queue.js';
+import { redis, notificationQueue, enqueueNotification } from './queue.js';
 import { localDayEnd, localJobDate, scheduleSameDay } from './time.js';
 
 function logWorkerEvent(level: 'info' | 'error', event: string, details: Record<string, unknown> = {}) {
@@ -31,13 +31,40 @@ const worker = new Worker('referral-notifications', async queueJob => {
     await prisma.notification.update({ where: { id: notification.id }, data: { status: 'CANCELLED' } });
     return;
   }
-  if (notification.type === 'APPLY_DIRECTLY' && job.applyDirectNotificationSentAt) return;
-  await prisma.notification.update({ where: { id: notification.id }, data: { status: 'SENT', sentAt: now } });
-  if (notification.type === 'APPLY_DIRECTLY') {
-    await prisma.job.update({ where: { id: job.id }, data: { applyDirectNotificationSentAt: now } });
+  if (notification.type === 'APPLY_DIRECTLY' && job.applyDirectNotificationSentAt) {
+    await prisma.notification.update({ where: { id: notification.id }, data: { status: 'CANCELLED' } });
     return;
   }
-  const next = scheduleSameDay(now, job.user.followUpIntervalMinutes / 60, job.user.timezone);
+  if (notification.type === 'FOLLOW_UP' && (
+    job.applyDirectNotificationSentAt ||
+    (job.applyDirectNotificationAt && (now >= job.applyDirectNotificationAt || notification.scheduledAt >= job.applyDirectNotificationAt))
+  )) {
+    await prisma.notification.update({ where: { id: notification.id }, data: { status: 'CANCELLED' } });
+    await prisma.job.update({ where: { id: job.id }, data: { nextFollowUpAt: null } });
+    return;
+  }
+  await prisma.notification.update({ where: { id: notification.id }, data: { status: 'SENT', sentAt: now } });
+  if (notification.type === 'APPLY_DIRECTLY') {
+    const pendingFollowUps = await prisma.notification.findMany({ where: { jobId: job.id, type: 'FOLLOW_UP', status: 'SCHEDULED' } });
+    await prisma.notification.updateMany({ where: { jobId: job.id, type: 'FOLLOW_UP', status: 'SCHEDULED' }, data: { status: 'CANCELLED' } });
+    await prisma.job.update({ where: { id: job.id }, data: { applyDirectNotificationSentAt: now, nextFollowUpAt: null } });
+    await Promise.all(pendingFollowUps.map(async followUp => {
+      try {
+        const queuedJob = await notificationQueue.getJob(`notification-${followUp.id}`);
+        if (queuedJob) await queuedJob.remove();
+      } catch (error) {
+        logWorkerEvent('error', 'follow_up_queue.remove_failed', {
+          notificationId: followUp.id,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }));
+    return;
+  }
+  const nextCandidate = scheduleSameDay(now, job.user.followUpIntervalMinutes / 60, job.user.timezone);
+  const next = nextCandidate && (!job.applyDirectNotificationAt || nextCandidate < job.applyDirectNotificationAt)
+    ? nextCandidate
+    : null;
   if (next) {
     const followUp = await prisma.notification.create({ data: { userId: job.userId, jobId: job.id, type: 'FOLLOW_UP', scheduledAt: next } });
     await enqueueNotification(followUp.id, next);
