@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { createServer } from 'node:http';
 import { Worker } from 'bullmq';
 import { prisma } from './db.js';
 import { redis, notificationQueue, enqueueNotification } from './queue.js';
@@ -9,6 +10,21 @@ function logWorkerEvent(level: 'info' | 'error', event: string, details: Record<
   if (level === 'error') console.error(payload);
   else console.log(payload);
 }
+
+const port = Number(process.env.PORT ?? 3001);
+const healthServer = createServer((request, response) => {
+  if (request.url === '/' || request.url === '/health') {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: true, service: 'notification-worker' }));
+    return;
+  }
+  response.writeHead(404, { 'Content-Type': 'application/json' });
+  response.end(JSON.stringify({ error: 'Not found' }));
+});
+
+healthServer.listen(port, '0.0.0.0', () => {
+  logWorkerEvent('info', 'worker.health_server.started', { host: '0.0.0.0', port });
+});
 
 const worker = new Worker('referral-notifications', async queueJob => {
   const { notificationId } = queueJob.data as { notificationId: string };
